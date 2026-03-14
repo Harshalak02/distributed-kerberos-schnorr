@@ -58,15 +58,25 @@ THRESHOLD = 2
 # Low-level HTTP helpers
 # ---------------------------------------------------------------------------
 
-def http_post(url: str, payload: dict, timeout: int = 5) -> dict:
-    data = json.dumps(payload).encode()
+def http_post(url: str, payload: dict, timeout: int = 30) -> dict:
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type":   "application/json",
+            "Content-Length": str(len(data)),
+        },
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return json.loads(body)
+        except Exception:
+            raise RuntimeError(f"HTTP {e.code}: {body}")
 
 
 def http_get(url: str, timeout: int = 5) -> dict:

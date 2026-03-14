@@ -96,11 +96,11 @@ class ASHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
+        length = self.headers.get("Content-Length")
+        raw = self.rfile.read(int(length)) if length else self.rfile.read()
+        if not raw:
             return {}
-        raw = self.rfile.read(length)
-        return json.loads(raw.decode())
+        return json.loads(raw.decode("utf-8"))
 
     # ------------------------------------------------------------------
     def do_GET(self):
@@ -185,10 +185,8 @@ class ASHandler(BaseHTTPRequestHandler):
                 "service_id":   service_id,
                 "issue_time":   int(time.time()),
                 "lifetime":     TGT_LIFETIME,
-                "authority_id": self.authority_id,
                 "key_version":  key_version,
                 "client_nonce": client_nonce,
-                # session_key is NOT in plaintext payload; it's encrypted separately
             }
 
             # Canonical message for signing = deterministic JSON dump
@@ -204,7 +202,6 @@ class ASHandler(BaseHTTPRequestHandler):
             session_key_enc, sk_iv = aes256_cbc_encrypt(client_key, session_key)
 
             response = {
-                "authority_id":    self.authority_id,
                 "key_version":     key_version,
                 "session_key_enc": bytes_to_b64(session_key_enc),
                 "session_key_iv":  bytes_to_b64(sk_iv),
