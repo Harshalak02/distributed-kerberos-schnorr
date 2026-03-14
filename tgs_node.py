@@ -99,10 +99,11 @@ class TGSHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
+        length = self.headers.get("Content-Length")
+        raw = self.rfile.read(int(length)) if length else self.rfile.read()
+        if not raw:
             return {}
-        return json.loads(self.rfile.read(length).decode())
+        return json.loads(raw.decode("utf-8"))
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -232,7 +233,6 @@ class TGSHandler(BaseHTTPRequestHandler):
                 "service_id":   requested_service_id,
                 "issue_time":   int(time.time()),
                 "lifetime":     ST_LIFETIME,
-                "authority_id": self.authority_id,
                 "key_version":  key_version,
             }
 
