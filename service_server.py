@@ -44,6 +44,11 @@ MINIMUM_KEY_VERSION = 1
 ST_THRESHOLD = 2
 
 
+def derive_service_key(service_id: str) -> bytes:
+    import hashlib
+    return hashlib.sha256((service_id + "-service-demo-key").encode()).digest()
+
+
 def load_public_registry() -> dict:
     path = os.path.join(KEYS_DIR, "public_key_registry.json")
     with open(path) as f:
@@ -111,17 +116,10 @@ class ServiceHandler(BaseHTTPRequestHandler):
         """
         Client sends:
             {
-              "service_ticket": {
-                  "payload":            { ... service_ticket_payload ... },
-                  "signatures":         [ {R, s, authority_id}, ... ],
-                  "service_session_key_enc": "<b64>",
-                  "service_session_key_iv":  "<b64>"
-              },
-              "authenticator": {
-                  "client_id":  "alice",
-                  "timestamp":  1700000002
-              },
-              "session_key_for_decrypt": "<b64 raw key>"  # provided for demo decrypt
+              "service_ticket_enc": "<b64 AES>",
+              "service_ticket_iv":  "<b64 IV>",
+              "authenticator_enc":  "<b64 AES>",
+              "authenticator_iv":   "<b64 IV>"
             }
 
         Service verifies:
@@ -134,35 +132,41 @@ class ServiceHandler(BaseHTTPRequestHandler):
         """
         try:
             req = self.read_json_body()
-            service_ticket = req.get("service_ticket", {})
-            authenticator = req.get("authenticator", {})
-            session_key_b64 = req.get("session_key_for_decrypt", "")
+            ticket_enc = b64_to_bytes(req.get("service_ticket_enc", ""))
+            ticket_iv = b64_to_bytes(req.get("service_ticket_iv", ""))
+            auth_enc = b64_to_bytes(req.get("authenticator_enc", ""))
+            auth_iv = b64_to_bytes(req.get("authenticator_iv", ""))
 
-            if not service_ticket or not authenticator:
-                self.send_json(400, {"error": "service_ticket and authenticator required"})
+            if not ticket_enc or not ticket_iv or not auth_enc or not auth_iv:
+                self.send_json(400, {"error": "encrypted service_ticket and authenticator required"})
+                return
+
+            service_key = derive_service_key(self.service_id)
+            try:
+                ticket_plain = aes256_cbc_decrypt(service_key, ticket_enc, ticket_iv)
+                service_ticket = json.loads(ticket_plain.decode("utf-8"))
+            except Exception:
+                self.send_json(403, {"error": "Could not decrypt service ticket"})
                 return
 
             st_payload = service_ticket.get("payload", {})
             st_signatures = service_ticket.get("signatures", [])
-            ssk_enc = b64_to_bytes(service_ticket.get("service_session_key_enc", ""))
-            ssk_iv = b64_to_bytes(service_ticket.get("service_session_key_iv", ""))
+            service_session_key = b64_to_bytes(service_ticket.get("service_session_key", ""))
+
+            # ---- 1. Verify ticket carries service session key ----
+            if len(service_session_key) != 32:
+                self.send_json(403, {"error": "Service session key missing/invalid in ticket"})
+                return
+
+            try:
+                auth_plain = aes256_cbc_decrypt(service_session_key, auth_enc, auth_iv)
+                authenticator = json.loads(auth_plain.decode("utf-8"))
+            except Exception:
+                self.send_json(403, {"error": "Authenticator decrypt/parse failed"})
+                return
 
             client_id = authenticator.get("client_id", "")
             auth_time = authenticator.get("timestamp", 0)
-
-            # ---- 1. Verify AES encryption / decrypt service session key ----
-            if session_key_b64:
-                session_key = b64_to_bytes(session_key_b64)
-                try:
-                    service_session_key = aes256_cbc_decrypt(session_key, ssk_enc, ssk_iv)
-                except Exception:
-                    self.send_json(403, {"error": "AES decryption failed — invalid session key"})
-                    return
-            else:
-                # In a full implementation client would prove knowledge of service_session_key.
-                # For demo, absence is allowed but logged.
-                service_session_key = None
-                print(f"[ServiceServer:{self.service_id}] WARNING: no session key provided for demo")
 
             # ---- 2. Verify service_id matches ----
             if st_payload.get("service_id") != self.service_id:
@@ -224,6 +228,18 @@ class ServiceHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+            # Ensure payload key_version matches every valid signer's current key_version.
+            for signer in valid_signers:
+                expected_version = self.public_registry.get(signer, {}).get("key_version")
+                if expected_version is not None and key_version != expected_version:
+                    self.send_json(403, {
+                        "error": (
+                            f"Service ticket rejected: key_version mismatch for signer {signer} "
+                            f"(payload={key_version}, registry={expected_version})"
+                        )
+                    })
+                    return
+
             # ---- Access granted ----
             print(f"[ServiceServer:{self.service_id}] ACCESS GRANTED "
                   f"client={client_id}, signers={valid_signers}")
@@ -232,7 +248,7 @@ class ServiceHandler(BaseHTTPRequestHandler):
                 "service_id":    self.service_id,
                 "client_id":     client_id,
                 "valid_signers": valid_signers,
-                "session_established": service_session_key is not None
+                "session_established": True
             })
 
         except Exception as exc:
