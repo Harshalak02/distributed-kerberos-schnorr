@@ -142,18 +142,11 @@ class ASHandler(BaseHTTPRequestHandler):
               "nonce":       12345678   (client-chosen, prevents replay)
             }
 
-        AS responds:
+        AS responds (encrypted for the client):
             {
-              "authority_id":    "AS1",
-              "key_version":     1,
-              "session_key_enc": "<base64 AES-encrypted session key>",
-              "session_key_iv":  "<base64 IV>",
-              "ticket_payload":  { ... raw ticket fields ... },
-              "signature": {
-                  "R":            "<base64 big-int>",
-                  "s":            "<base64 big-int>",
-                  "authority_id": "AS1"
-              }
+              "authority_id": "AS1",
+              "as_reply_enc": "<base64 AES-256-CBC>",
+              "as_reply_iv":  "<base64 IV>"
             }
         """
         try:
@@ -167,6 +160,12 @@ class ASHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "client_id required"})
                 return
              # Basic freshness check (5-minute skew window)
+            now = int(time.time())
+            if abs(now - int(timestamp)) > 300:
+                self.send_json(400, {"error": "timestamp outside allowed freshness window"})
+                return
+
+            # Basic freshness check (5-minute skew window)
             now = int(time.time())
             if abs(now - int(timestamp)) > 300:
                 self.send_json(400, {"error": "timestamp outside allowed freshness window"})
@@ -188,7 +187,8 @@ class ASHandler(BaseHTTPRequestHandler):
             ticket_payload = {
                 "client_id":    client_id,
                 "service_id":   service_id,
-               # "issue_time":   int(time.time()),
+                # Keep issue_time deterministic across AS authorities for same request,
+                # so multiple signatures can be collected over the exact same payload.
                 "issue_time":   int(timestamp),
                 "lifetime":     TGT_LIFETIME,
                 "key_version":  key_version,
@@ -207,7 +207,7 @@ class ASHandler(BaseHTTPRequestHandler):
             client_key = derive_client_key(client_id)
             session_key_enc, sk_iv = aes256_cbc_encrypt(client_key, session_key)
 
-            response = {
+            inner_reply = {
                 "key_version":     key_version,
                 "session_key_enc": bytes_to_b64(session_key_enc),
                 "session_key_iv":  bytes_to_b64(sk_iv),
@@ -217,6 +217,14 @@ class ASHandler(BaseHTTPRequestHandler):
                     "s":            int_to_b64(s),
                     "authority_id": self.authority_id
                 }
+            }
+            inner_bytes = json.dumps(inner_reply, sort_keys=True).encode("utf-8")
+            as_reply_enc, as_reply_iv = aes256_cbc_encrypt(client_key, inner_bytes)
+
+            response = {
+                "authority_id": self.authority_id,
+                "as_reply_enc": bytes_to_b64(as_reply_enc),
+                "as_reply_iv": bytes_to_b64(as_reply_iv),
             }
 
             print(f"[{self.authority_id}] Issued TGT partial signature for client={client_id}")
