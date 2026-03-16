@@ -1,58 +1,100 @@
 """
 attacks.py
 
-Mandatory attack scenario demonstrations for the Kerberos multi-signature system.
+Mandatory attack scenario demonstrations for the Kerberos multi-signature system,
+executed over LIVE AS/TGS services via HTTP requests.
 
 Scenarios implemented:
-  1. Single malicious authority issuing a forged ticket
-  2. Modified ticket payload (tampered content)
-  3. Replay of an old partial signature
+  1. Single malicious authority issuing forged ticket
+  2. Modified ticket payload
+  3. Replay of old partial signature
   4. Leakage of one authority's private signing key
   5. Authority offline scenario
   6. Ticket containing only one valid signature
 
 Run:
   python attacks.py
+
+Prerequisite:
+  Start AS/TGS servers first (see README).
 """
 
 import json
 import os
 import sys
 import time
-import copy
+import urllib.request
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from crypto_utils import (
-    schnorr_sign, schnorr_verify,
-    schnorr_keygen,
+    schnorr_sign,
     aes256_cbc_encrypt, aes256_cbc_decrypt,
-    generate_aes_key,
-    verify_multisig,
+    secure_random_int,
     bytes_to_b64, b64_to_bytes,
     int_to_b64, b64_to_int,
-    secure_random_int,
-    SCHNORR_P, SCHNORR_Q, SCHNORR_G,
-    mod_exp
+    SCHNORR_G, SCHNORR_Q, SCHNORR_P,
+    mod_exp,
 )
 
 KEYS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys")
 
+AS_NODES = {
+    "AS1": "http://127.0.0.1:5001",
+    "AS2": "http://127.0.0.1:5002",
+    "AS3": "http://127.0.0.1:5003",
+}
+TGS_NODES = {
+    "TGS1": "http://127.0.0.1:6001",
+    "TGS2": "http://127.0.0.1:6002",
+    "TGS3": "http://127.0.0.1:6003",
+}
+
 PASS = "✅  CONTAINED"
 FAIL = "❌  SYSTEM BROKEN"
+SKIP = "⚠️  SKIPPED (server unavailable)"
+DIVIDER = "=" * 72
 
-DIVIDER = "=" * 65
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def http_post(url: str, payload: dict, timeout: int = 8) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "Content-Length": str(len(data))},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return json.loads(body)
+        except Exception:
+            return {"error": f"HTTP {e.code}: {body}"}
 
 
-def load_public_registry() -> dict:
-    path = os.path.join(KEYS_DIR, "public_key_registry.json")
-    with open(path) as f:
-        raw = json.load(f)
-    for k in raw:
-        y = raw[k].get("y")
-        if isinstance(y, str):
-            raw[k]["y"] = b64_to_int(y)
-    return raw
+def derive_client_key(client_id: str) -> bytes:
+    import hashlib
+    return hashlib.sha256((client_id + "kerberos-demo-key").encode()).digest()
+
+
+def derive_tgs_cluster_key() -> bytes:
+    import hashlib
+    return hashlib.sha256(b"tgs-cluster-shared-demo-key").digest()
+
+
+def decode_as_reply(client_id: str, as_response: dict) -> dict:
+    enc = b64_to_bytes(as_response["as_reply_enc"])
+    iv = b64_to_bytes(as_response["as_reply_iv"])
+    pt = aes256_cbc_decrypt(derive_client_key(client_id), enc, iv)
+    return json.loads(pt.decode("utf-8"))
 
 
 def load_private_key(authority_id: str) -> dict:
@@ -61,354 +103,298 @@ def load_private_key(authority_id: str) -> dict:
         return json.load(f)
 
 
-def build_legitimate_ticket(client_id="alice", service_id="TGS") -> tuple:
-    """Helper: build a valid 2-of-3 signed ticket and return (payload, sigs, registry)."""
-    pub_reg = load_public_registry()
+def find_tgs_base() -> str:
+    for _, base in TGS_NODES.items():
+        try:
+            r = http_post(f"{base}/grant_service_ticket", {})
+            # Any JSON reply means server reachable.
+            if isinstance(r, dict):
+                return base
+        except Exception:
+            pass
+    return ""
 
-    ticket_payload = {
-        "client_id":    client_id,
-        "service_id":   service_id,
-        "issue_time":   int(time.time()),
-        "lifetime":     28800,
-        "authority_id": "multi",
-        "key_version":  1,
-        "client_nonce": secure_random_int(1, 2**32)
+
+def build_tgs_request_from_ticket(ticket: dict, client_id: str, session_key: bytes,
+                                  requested_service: str = "file_server") -> dict:
+    tgs_key = derive_tgs_cluster_key()
+    tgt_bytes = json.dumps(ticket, sort_keys=True).encode("utf-8")
+    tgt_enc, tgt_iv = aes256_cbc_encrypt(tgs_key, tgt_bytes)
+
+    authenticator = {
+        "client_id": client_id,
+        "timestamp": int(time.time()),
+        "nonce": secure_random_int(1, 2**32),
     }
-    msg_bytes = json.dumps(ticket_payload, sort_keys=True).encode()
+    auth_bytes = json.dumps(authenticator, sort_keys=True).encode("utf-8")
+    auth_enc, auth_iv = aes256_cbc_encrypt(session_key, auth_bytes)
 
-    sigs = []
-    for auth_id in ["AS1", "AS2"]:
-        kd = load_private_key(auth_id)
-        R, s = schnorr_sign(msg_bytes, kd["x"], auth_id)
-        sigs.append({"R": R, "s": s, "authority_id": auth_id})
-
-    return ticket_payload, sigs, pub_reg
-
-
-# =============================================================================
-# Attack 1: Single malicious authority tries to forge a ticket alone
-# =============================================================================
-
-def attack_1_single_malicious_authority():
-    print(f"\n{DIVIDER}")
-    print("ATTACK 1: Single Malicious Authority Forging a Ticket")
-    print(DIVIDER)
-    print("Scenario: AS1 is compromised. Adversary uses AS1's private key")
-    print("          to sign a ticket for 'root' and presents only AS1's signature.")
-
-    pub_reg = load_public_registry()
-    kd = load_private_key("AS1")
-
-    forged_payload = {
-        "client_id":    "root",          # escalated privilege
-        "service_id":   "TGS",
-        "issue_time":   int(time.time()),
-        "lifetime":     28800,
-        "authority_id": "AS1",
-        "key_version":  1,
-        "client_nonce": 0
+    return {
+        "tgt_enc": bytes_to_b64(tgt_enc),
+        "tgt_iv": bytes_to_b64(tgt_iv),
+        "authenticator_enc": bytes_to_b64(auth_enc),
+        "authenticator_iv": bytes_to_b64(auth_iv),
+        "requested_service_id": requested_service,
     }
-    msg_bytes = json.dumps(forged_payload, sort_keys=True).encode()
-    R, s = schnorr_sign(msg_bytes, kd["x"], "AS1")
 
-    # Only one signature
-    sigs = [{"R": R, "s": s, "authority_id": "AS1"}]
 
-    as_reg = {k: v for k, v in pub_reg.items() if k.startswith("AS")}
-    valid, valid_signers = verify_multisig(msg_bytes, sigs, as_reg, threshold=2)
+def request_as_partial(client_id: str, authority_id: str, timestamp: int, nonce: int,
+                       service_id: str = "TGS") -> dict:
+    base = AS_NODES[authority_id]
+    req = {
+        "client_id": client_id,
+        "service_id": service_id,
+        "timestamp": timestamp,
+        "nonce": nonce,
+    }
+    resp = http_post(f"{base}/authenticate", req)
+    if "error" in resp:
+        raise RuntimeError(f"{authority_id} error: {resp['error']}")
+    return decode_as_reply(client_id, resp)
 
-    print(f"\n  Forged by:    AS1 only")
-    print(f"  Valid signers: {valid_signers}")
-    print(f"  Ticket accepted? {valid}")
-    if not valid:
-        print(f"  Result: {PASS}")
-        print("  Reason: Threshold=2 requires TWO independent signatures.")
-        print("          Single authority cannot satisfy the 2-of-3 policy.")
+
+def build_ticket_from_as_partials(client_id: str, partials: list) -> tuple:
+    if not partials:
+        raise ValueError("No AS partials")
+
+    canonical_payload = partials[0]["ticket_payload"]
+    signatures = [p["signature"] for p in partials]
+
+    sk_enc = partials[0]["session_key_enc"]
+    sk_iv = partials[0]["session_key_iv"]
+    session_key = aes256_cbc_decrypt(
+        derive_client_key(client_id), b64_to_bytes(sk_enc), b64_to_bytes(sk_iv)
+    )
+
+    ticket = {
+        "ticket_payload": canonical_payload,
+        "signatures": signatures,
+        "session_key_enc": sk_enc,
+        "session_key_iv": sk_iv,
+    }
+    return ticket, session_key
+
+
+def print_tgs_result(result: dict, expect_reject: bool):
+    accepted = "error" not in result
+    print("  TGS response:", json.dumps(result, indent=2))
+    print("  Ticket accepted by TGS?", accepted)
+    if expect_reject:
+        print("  Result:", PASS if not accepted else FAIL)
     else:
-        print(f"  Result: {FAIL}")
+        print("  Result:", PASS if accepted else FAIL)
 
 
-# =============================================================================
-# Attack 2: Modified ticket payload (integrity violation)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Attacks (networked)
+# ---------------------------------------------------------------------------
 
-def attack_2_modified_payload():
-    print(f"\n{DIVIDER}")
-    print("ATTACK 2: Modified Ticket Payload (Tampering)")
-    print(DIVIDER)
-    print("Scenario: Signatures from AS1+AS2 cover the original payload.")
-    print("          Adversary modifies client_id to 'root' AFTER signing.")
+def attack_1_single_malicious_authority(tgs_base: str):
+    print(f"\n{DIVIDER}\nATTACK 1: Single malicious authority forged ticket\n{DIVIDER}")
+    print("Scenario: attacker uses leaked AS1 private key and sends only one signature.")
 
-    ticket_payload, sigs, pub_reg = build_legitimate_ticket("alice")
+    kd1 = load_private_key("AS1")
+    client_id = "evil_root"
+    session_key = os.urandom(32)
 
-    # Signatures cover original payload
-    original_msg = json.dumps(ticket_payload, sort_keys=True).encode()
+    payload = {
+        "client_id": client_id,
+        "service_id": "TGS",
+        "issue_time": int(time.time()),
+        "lifetime": 28800,
+        "key_version": kd1.get("key_version", 1),
+        "client_nonce": 1111,
+    }
+    msg = json.dumps(payload, sort_keys=True).encode("utf-8")
+    R1, s1 = schnorr_sign(msg, kd1["x"], "AS1")
 
-    # Tamper with client_id
-    tampered_payload = dict(ticket_payload)
+    ck = derive_client_key(client_id)
+    sk_enc, sk_iv = aes256_cbc_encrypt(ck, session_key)
+
+    forged_ticket = {
+        "ticket_payload": payload,
+        "signatures": [{"R": int_to_b64(R1), "s": int_to_b64(s1), "authority_id": "AS1"}],
+        "session_key_enc": bytes_to_b64(sk_enc),
+        "session_key_iv": bytes_to_b64(sk_iv),
+    }
+    req = build_tgs_request_from_ticket(forged_ticket, client_id, session_key)
+    result = http_post(f"{tgs_base}/grant_service_ticket", req)
+    print_tgs_result(result, expect_reject=True)
+
+
+def attack_2_modified_ticket_payload(tgs_base: str):
+    print(f"\n{DIVIDER}\nATTACK 2: Modified ticket payload\n{DIVIDER}")
+    print("Scenario: get valid AS1+AS2 signatures, then tamper payload before sending to TGS.")
+
+    client_id = "alice"
+    ts = int(time.time())
+    n = secure_random_int(1, 2**32)
+
+    p1 = request_as_partial(client_id, "AS1", ts, n)
+    p2 = request_as_partial(client_id, "AS2", ts, n)
+    ticket, session_key = build_ticket_from_as_partials(client_id, [p1, p2])
+
+    tampered = dict(ticket)
+    tampered_payload = dict(ticket["ticket_payload"])
     tampered_payload["client_id"] = "root"
-    tampered_msg = json.dumps(tampered_payload, sort_keys=True).encode()
+    tampered["ticket_payload"] = tampered_payload
 
-    # Decode sigs for verification
-    decoded_sigs = [{"R": s["R"], "s": s["s"], "authority_id": s["authority_id"]}
-                    for s in sigs]
-
-    as_reg = {k: v for k, v in pub_reg.items() if k.startswith("AS")}
-
-    # Verify TAMPERED payload against original signatures
-    valid, valid_signers = verify_multisig(tampered_msg, decoded_sigs, as_reg, threshold=2)
-
-    print(f"\n  Original client_id:  alice")
-    print(f"  Tampered client_id:  root")
-    print(f"  Signatures valid on tampered payload? {valid}")
-    if not valid:
-        print(f"  Result: {PASS}")
-        print("  Reason: Schnorr challenge e = H(msg || R || ID).")
-        print("          Changing msg changes e, breaking the verification equation.")
-    else:
-        print(f"  Result: {FAIL}")
+    req = build_tgs_request_from_ticket(tampered, client_id, session_key)
+    result = http_post(f"{tgs_base}/grant_service_ticket", req)
+    print_tgs_result(result, expect_reject=True)
 
 
-# =============================================================================
-# Attack 3: Replay of an old partial signature
-# =============================================================================
+def attack_3_replay_old_partial_signature(tgs_base: str):
+    print(f"\n{DIVIDER}\nATTACK 3: Replay old partial signature\n{DIVIDER}")
+    print("Scenario: replay AS1 signature from old auth round with AS2 signature from new round.")
 
-def attack_3_replay_old_signature():
-    print(f"\n{DIVIDER}")
-    print("ATTACK 3: Replay of Old Partial Signature")
-    print(DIVIDER)
-    print("Scenario: Adversary captures (R1, s1) from AS1 for an OLD ticket.")
-    print("          Tries to reuse it in a NEW ticket.")
+    client_id = "alice"
 
-    pub_reg = load_public_registry()
+    ts_old = int(time.time()) - 20
+    old = request_as_partial(client_id, "AS1", ts_old, 12345)
+
+    ts_new = int(time.time())
+    new = request_as_partial(client_id, "AS2", ts_new, 67890)
+
+    # Mix old AS1 signature into new payload ticket
+    mixed_ticket = {
+        "ticket_payload": new["ticket_payload"],
+        "signatures": [old["signature"], new["signature"]],
+        "session_key_enc": new["session_key_enc"],
+        "session_key_iv": new["session_key_iv"],
+    }
+    session_key = aes256_cbc_decrypt(
+        derive_client_key(client_id),
+        b64_to_bytes(new["session_key_enc"]),
+        b64_to_bytes(new["session_key_iv"]),
+    )
+
+    req = build_tgs_request_from_ticket(mixed_ticket, client_id, session_key)
+    result = http_post(f"{tgs_base}/grant_service_ticket", req)
+    print_tgs_result(result, expect_reject=True)
+
+
+def attack_4_one_key_leakage(tgs_base: str):
+    print(f"\n{DIVIDER}\nATTACK 4: One authority private key leakage\n{DIVIDER}")
+    print("Scenario: attacker has AS1 key, forges AS1 sig and fakes AS2 signature.")
+
     kd1 = load_private_key("AS1")
-
-    # OLD ticket — signed at t=0
-    old_payload = {
-        "client_id":    "alice",
-        "service_id":   "TGS",
-        "issue_time":   1000000,   # old timestamp
-        "lifetime":     28800,
-        "authority_id": "AS1",
-        "key_version":  1,
-        "client_nonce": 11111111
+    client_id = "mallory"
+    payload = {
+        "client_id": client_id,
+        "service_id": "TGS",
+        "issue_time": int(time.time()),
+        "lifetime": 28800,
+        "key_version": kd1.get("key_version", 1),
+        "client_nonce": 2222,
     }
-    old_msg = json.dumps(old_payload, sort_keys=True).encode()
-    R_old, s_old = schnorr_sign(old_msg, kd1["x"], "AS1")
+    msg = json.dumps(payload, sort_keys=True).encode("utf-8")
 
-    # NEW ticket — different payload (current time, different nonce)
-    new_payload = {
-        "client_id":    "alice",
-        "service_id":   "TGS",
-        "issue_time":   int(time.time()),
-        "lifetime":     28800,
-        "authority_id": "AS1",
-        "key_version":  1,
-        "client_nonce": 22222222
-    }
-    new_msg = json.dumps(new_payload, sort_keys=True).encode()
-
-    # Generate fresh AS2 signature for new payload
-    kd2 = load_private_key("AS2")
-    R2, s2 = schnorr_sign(new_msg, kd2["x"], "AS2")
-
-    # Replay AS1's OLD signature against NEW payload
-    mixed_sigs = [
-        {"R": R_old, "s": s_old, "authority_id": "AS1"},  # replayed
-        {"R": R2,    "s": s2,    "authority_id": "AS2"},   # fresh
-    ]
-
-    as_reg = {k: v for k, v in pub_reg.items() if k.startswith("AS")}
-    valid, valid_signers = verify_multisig(new_msg, mixed_sigs, as_reg, threshold=2)
-
-    print(f"\n  Old signature: covers issue_time=1000000, nonce=11111111")
-    print(f"  New payload:   covers issue_time={new_payload['issue_time']}, nonce=22222222")
-    print(f"  AS1 replayed, AS2 fresh. Ticket accepted? {valid}")
-    if not valid:
-        print(f"  Result: {PASS}")
-        print("  Reason: e = H(msg || R || ID) binds signature to EXACT payload.")
-        print("          Replayed (R_old, s_old) does not match new_msg hash.")
-    else:
-        print(f"  Result: {FAIL}")
-
-
-# =============================================================================
-# Attack 4: Leakage of one authority's private key
-# =============================================================================
-
-def attack_4_key_leakage():
-    print(f"\n{DIVIDER}")
-    print("ATTACK 4: Leakage of One Authority's Private Key")
-    print(DIVIDER)
-    print("Scenario: Adversary steals x1 (AS1's private key).")
-    print("          Tries to forge a ticket signed only by AS1 (using leaked key).")
-
-    pub_reg = load_public_registry()
-    kd1 = load_private_key("AS1")
-    leaked_x1 = kd1["x"]  # adversary has this
-
-    forged_payload = {
-        "client_id":    "evil_user",
-        "service_id":   "TGS",
-        "issue_time":   int(time.time()),
-        "lifetime":     28800,
-        "authority_id": "AS1",
-        "key_version":  1,
-        "client_nonce": 99999999
-    }
-    msg_bytes = json.dumps(forged_payload, sort_keys=True).encode()
-
-    # Adversary can produce a valid AS1 signature using leaked key
-    R1, s1 = schnorr_sign(msg_bytes, leaked_x1, "AS1")
-
-    # Adversary does NOT have AS2's key, so produces a random fake signature
+    R1, s1 = schnorr_sign(msg, kd1["x"], "AS1")
     fake_R = mod_exp(SCHNORR_G, secure_random_int(2, SCHNORR_Q - 1), SCHNORR_P)
     fake_s = secure_random_int(2, SCHNORR_Q - 1)
 
-    mixed_sigs = [
-        {"R": R1,     "s": s1,     "authority_id": "AS1"},  # genuine
-        {"R": fake_R, "s": fake_s, "authority_id": "AS2"},  # forged
-    ]
+    session_key = os.urandom(32)
+    sk_enc, sk_iv = aes256_cbc_encrypt(derive_client_key(client_id), session_key)
 
-    as_reg = {k: v for k, v in pub_reg.items() if k.startswith("AS")}
-    valid, valid_signers = verify_multisig(msg_bytes, mixed_sigs, as_reg, threshold=2)
-
-    print(f"\n  AS1 signature (with leaked key): valid? "
-          f"{schnorr_verify(msg_bytes, R1, s1, pub_reg['AS1']['y'], 'AS1')}")
-    print(f"  AS2 signature (forged):          valid? "
-          f"{schnorr_verify(msg_bytes, fake_R, fake_s, pub_reg['AS2']['y'], 'AS2')}")
-    print(f"  Ticket accepted with forged AS2? {valid}")
-    if not valid:
-        print(f"  Result: {PASS}")
-        print("  Reason: Even with one leaked key, adversary cannot forge the SECOND")
-        print("          signature without breaking discrete logarithm for AS2.")
-    else:
-        print(f"  Result: {FAIL}")
-
-    # Sanity: show that with BOTH real keys the ticket IS accepted
-    kd2 = load_private_key("AS2")
-    R2, s2 = schnorr_sign(msg_bytes, kd2["x"], "AS2")
-    real_sigs = [
-        {"R": R1, "s": s1, "authority_id": "AS1"},
-        {"R": R2, "s": s2, "authority_id": "AS2"},
-    ]
-    valid2, _ = verify_multisig(msg_bytes, real_sigs, as_reg, threshold=2)
-    print(f"\n  [Sanity] With both real keys → accepted? {valid2}  (should be True)")
-
-
-# =============================================================================
-# Attack 5: Authority offline scenario
-# =============================================================================
-
-def attack_5_authority_offline():
-    print(f"\n{DIVIDER}")
-    print("ATTACK 5: One Authority Offline")
-    print(DIVIDER)
-    print("Scenario: AS1 is offline (unreachable). Client can still authenticate")
-    print("          using AS2 + AS3 signatures (system remains live).")
-
-    pub_reg = load_public_registry()
-
-    ticket_payload = {
-        "client_id":    "bob",
-        "service_id":   "TGS",
-        "issue_time":   int(time.time()),
-        "lifetime":     28800,
-        "authority_id": "multi",
-        "key_version":  1,
-        "client_nonce": secure_random_int(1, 2**32)
+    forged_ticket = {
+        "ticket_payload": payload,
+        "signatures": [
+            {"R": int_to_b64(R1), "s": int_to_b64(s1), "authority_id": "AS1"},
+            {"R": int_to_b64(fake_R), "s": int_to_b64(fake_s), "authority_id": "AS2"},
+        ],
+        "session_key_enc": bytes_to_b64(sk_enc),
+        "session_key_iv": bytes_to_b64(sk_iv),
     }
-    msg_bytes = json.dumps(ticket_payload, sort_keys=True).encode()
 
-    # AS1 is "offline" — only AS2 and AS3 respond
-    sigs = []
-    for auth_id in ["AS2", "AS3"]:
-        kd = load_private_key(auth_id)
-        R, s = schnorr_sign(msg_bytes, kd["x"], auth_id)
-        sigs.append({"R": R, "s": s, "authority_id": auth_id})
-
-    as_reg = {k: v for k, v in pub_reg.items() if k.startswith("AS")}
-    valid, valid_signers = verify_multisig(msg_bytes, sigs, as_reg, threshold=2)
-
-    print(f"\n  AS1 status:    OFFLINE")
-    print(f"  AS2 + AS3:     responded and signed")
-    print(f"  Valid signers: {valid_signers}")
-    print(f"  Ticket accepted? {valid}")
-    if valid:
-        print(f"  Result: {PASS}")
-        print("  Reason: 2-of-3 scheme tolerates one offline authority.")
-        print("          Availability is maintained even under partial failure.")
-    else:
-        print(f"  Result: {FAIL}")
+    req = build_tgs_request_from_ticket(forged_ticket, client_id, session_key)
+    result = http_post(f"{tgs_base}/grant_service_ticket", req)
+    print_tgs_result(result, expect_reject=True)
 
 
-# =============================================================================
-# Attack 6: Ticket with only one valid signature
-# =============================================================================
+def attack_5_authority_offline(tgs_base: str):
+    print(f"\n{DIVIDER}\nATTACK 5: One authority offline\n{DIVIDER}")
+    print("Scenario: AS1 is offline, but AS2+AS3 are enough for 2-of-3.")
 
-def attack_6_single_signature():
-    print(f"\n{DIVIDER}")
-    print("ATTACK 6: Ticket with Only One Valid Signature")
-    print(DIVIDER)
-    print("Scenario: Adversary intercepts AS2's response and discards it,")
-    print("          submitting a ticket with only AS1's signature.")
+    client_id = "bob"
+    ts = int(time.time())
+    nonce = secure_random_int(1, 2**32)
 
-    pub_reg = load_public_registry()
-    kd1 = load_private_key("AS1")
+    # Simulate offline AS1 by querying a wrong port.
+    offline_url = "http://127.0.0.1:5999/authenticate"
+    off_resp = http_post(offline_url, {
+        "client_id": client_id,
+        "service_id": "TGS",
+        "timestamp": ts,
+        "nonce": nonce,
+    })
+    print("  AS1 simulated offline response:", off_resp.get("error", "unreachable"))
 
-    ticket_payload = {
-        "client_id":    "charlie",
-        "service_id":   "TGS",
-        "issue_time":   int(time.time()),
-        "lifetime":     28800,
-        "authority_id": "AS1",
-        "key_version":  1,
-        "client_nonce": secure_random_int(1, 2**32)
+    p2 = request_as_partial(client_id, "AS2", ts, nonce)
+    p3 = request_as_partial(client_id, "AS3", ts, nonce)
+    ticket, session_key = build_ticket_from_as_partials(client_id, [p2, p3])
+
+    req = build_tgs_request_from_ticket(ticket, client_id, session_key)
+    result = http_post(f"{tgs_base}/grant_service_ticket", req)
+    print_tgs_result(result, expect_reject=False)
+
+
+def attack_6_single_valid_signature(tgs_base: str):
+    print(f"\n{DIVIDER}\nATTACK 6: Ticket with only one valid signature\n{DIVIDER}")
+    print("Scenario: submit ticket containing only AS1 signature.")
+
+    client_id = "charlie"
+    ts = int(time.time())
+    nonce = secure_random_int(1, 2**32)
+
+    p1 = request_as_partial(client_id, "AS1", ts, nonce)
+    session_key = aes256_cbc_decrypt(
+        derive_client_key(client_id),
+        b64_to_bytes(p1["session_key_enc"]),
+        b64_to_bytes(p1["session_key_iv"]),
+    )
+
+    ticket = {
+        "ticket_payload": p1["ticket_payload"],
+        "signatures": [p1["signature"]],
+        "session_key_enc": p1["session_key_enc"],
+        "session_key_iv": p1["session_key_iv"],
     }
-    msg_bytes = json.dumps(ticket_payload, sort_keys=True).encode()
-    R1, s1 = schnorr_sign(msg_bytes, kd1["x"], "AS1")
 
-    # Only one signature submitted
-    sigs = [{"R": R1, "s": s1, "authority_id": "AS1"}]
-
-    as_reg = {k: v for k, v in pub_reg.items() if k.startswith("AS")}
-    valid, valid_signers = verify_multisig(msg_bytes, sigs, as_reg, threshold=2)
-
-    print(f"\n  Signatures submitted: 1 (AS1 only)")
-    print(f"  Valid signers found:  {valid_signers}")
-    print(f"  Ticket accepted?      {valid}")
-    if not valid:
-        print(f"  Result: {PASS}")
-        print("  Reason: Policy requires threshold=2. Even a cryptographically")
-        print("          valid single signature is INSUFFICIENT.")
-    else:
-        print(f"  Result: {FAIL}")
+    req = build_tgs_request_from_ticket(ticket, client_id, session_key)
+    result = http_post(f"{tgs_base}/grant_service_ticket", req)
+    print_tgs_result(result, expect_reject=True)
 
 
-# =============================================================================
-# Main runner
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
 def run_all_attacks():
     print("\n" + DIVIDER)
-    print("  KERBEROS MULTI-SIG ATTACK SIMULATION SUITE")
+    print("  KERBEROS MULTI-SIG ATTACK SUITE (NETWORKED)")
     print(DIVIDER)
 
-    # Check keys exist
     if not os.path.exists(os.path.join(KEYS_DIR, "public_key_registry.json")):
         print("\n[!] Keys not found. Run 'python master_keygen.py' first.")
         sys.exit(1)
 
-    attack_1_single_malicious_authority()
-    attack_2_modified_payload()
-    attack_3_replay_old_signature()
-    attack_4_key_leakage()
-    attack_5_authority_offline()
-    attack_6_single_signature()
+    tgs_base = find_tgs_base()
+    if not tgs_base:
+        print(f"\n{SKIP}")
+        print("Start at least one TGS server (e.g., TGS1 on port 6001) and rerun.")
+        sys.exit(1)
 
-    print(f"\n{DIVIDER}")
-    print("  All attack scenarios demonstrated.")
-    print(DIVIDER)
+    print(f"[*] Using TGS endpoint: {tgs_base}")
+
+    attack_1_single_malicious_authority(tgs_base)
+    attack_2_modified_ticket_payload(tgs_base)
+    attack_3_replay_old_partial_signature(tgs_base)
+    attack_4_one_key_leakage(tgs_base)
+    attack_5_authority_offline(tgs_base)
+    attack_6_single_valid_signature(tgs_base)
+
+    print(f"\n{DIVIDER}\n  Completed all mandatory attack scenarios.\n{DIVIDER}")
 
 
 if __name__ == "__main__":

@@ -80,6 +80,11 @@ def derive_client_key(client_id: str) -> bytes:
     return hashlib.sha256((client_id + "kerberos-demo-key").encode()).digest()
 
 
+def derive_tgs_cluster_key() -> bytes:
+    import hashlib
+    return hashlib.sha256(b"tgs-cluster-shared-demo-key").digest()
+
+
 class TGSHandler(BaseHTTPRequestHandler):
     """HTTP handler for the Ticket Granting Server."""
 
@@ -134,17 +139,10 @@ class TGSHandler(BaseHTTPRequestHandler):
         """
         Client sends:
             {
-              "tgt": {
-                  "ticket_payload":  { ... },          # plaintext TGT fields
-                  "signatures":      [ {R, s, authority_id}, ... ],  # ≥2 AS signatures
-                  "session_key_enc": "<b64>",
-                  "session_key_iv":  "<b64>"
-              },
-              "authenticator": {
-                  "client_id":   "alice",
-                  "timestamp":   1700000001,
-                  "nonce":       99887766
-              },
+              "tgt_enc": "<b64 AES>",
+              "tgt_iv":  "<b64 IV>",
+              "authenticator_enc": "<b64 AES>",
+              "authenticator_iv":  "<b64 IV>",
               "requested_service_id": "file_server"
             }
 
@@ -153,26 +151,28 @@ class TGSHandler(BaseHTTPRequestHandler):
         """
         try:
             req = self.read_json_body()
-            tgt = req.get("tgt", {})
-            authenticator = req.get("authenticator", {})
+            tgt_enc = b64_to_bytes(req.get("tgt_enc", ""))
+            tgt_iv = b64_to_bytes(req.get("tgt_iv", ""))
+            auth_enc = b64_to_bytes(req.get("authenticator_enc", ""))
+            auth_iv = b64_to_bytes(req.get("authenticator_iv", ""))
             requested_service_id = req.get("requested_service_id", "")
 
-            if not tgt or not authenticator or not requested_service_id:
-                self.send_json(400, {"error": "tgt, authenticator, and requested_service_id required"})
+            if not tgt_enc or not tgt_iv or not auth_enc or not auth_iv or not requested_service_id:
+                self.send_json(400, {"error": "encrypted tgt/authenticator and requested_service_id required"})
+                return
+
+            tgs_cluster_key = derive_tgs_cluster_key()
+            try:
+                tgt_plain = aes256_cbc_decrypt(tgs_cluster_key, tgt_enc, tgt_iv)
+                tgt = json.loads(tgt_plain.decode("utf-8"))
+            except Exception:
+                self.send_json(403, {"error": "Could not decrypt TGT"})
                 return
 
             ticket_payload = tgt.get("ticket_payload", {})
             tgt_signatures = tgt.get("signatures", [])
             session_key_enc = b64_to_bytes(tgt.get("session_key_enc", ""))
             session_key_iv = b64_to_bytes(tgt.get("session_key_iv", ""))
-
-            client_id = authenticator.get("client_id", "")
-            auth_time = authenticator.get("timestamp", 0)
-
-            # --- Step 1: Replay protection ---
-            if is_replay(client_id, auth_time):
-                self.send_json(400, {"error": "Replay detected on authenticator"})
-                return
 
             # --- Step 2: Decode signatures (R and s are base64-encoded big ints) ---
             decoded_sigs = []
@@ -201,6 +201,19 @@ class TGSHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+            # Reject payloads signed under outdated/mismatched key versions.
+            payload_key_version = ticket_payload.get("key_version", 0)
+            for signer in valid_signers:
+                expected_version = self.public_registry.get(signer, {}).get("key_version")
+                if expected_version is not None and payload_key_version != expected_version:
+                    self.send_json(403, {
+                        "error": (
+                            f"TGT rejected: key_version mismatch for signer {signer} "
+                            f"(payload={payload_key_version}, registry={expected_version})"
+                        )
+                    })
+                    return
+
             # --- Step 4: Verify ticket is still live ---
             issue_time = ticket_payload.get("issue_time", 0)
             lifetime = ticket_payload.get("lifetime", 0)
@@ -208,17 +221,33 @@ class TGSHandler(BaseHTTPRequestHandler):
                 self.send_json(403, {"error": "TGT expired"})
                 return
 
-            # --- Step 5: Verify client_id matches TGT ---
-            if ticket_payload.get("client_id") != client_id:
-                self.send_json(403, {"error": "client_id mismatch between TGT and authenticator"})
-                return
-
             # --- Step 6: Decrypt session key (client's long-term key) ---
-            client_key = derive_client_key(client_id)
+            client_id_from_tgt = ticket_payload.get("client_id", "")
+            client_key = derive_client_key(client_id_from_tgt)
             try:
                 session_key = aes256_cbc_decrypt(client_key, session_key_enc, session_key_iv)
             except Exception:
                 self.send_json(403, {"error": "Could not decrypt session key — invalid client"})
+                return
+
+            try:
+                auth_plain = aes256_cbc_decrypt(session_key, auth_enc, auth_iv)
+                authenticator = json.loads(auth_plain.decode("utf-8"))
+            except Exception:
+                self.send_json(403, {"error": "Could not decrypt authenticator"})
+                return
+
+            client_id = authenticator.get("client_id", "")
+            auth_time = authenticator.get("timestamp", 0)
+
+            # --- Step 1: Replay protection ---
+            if is_replay(client_id, auth_time):
+                self.send_json(400, {"error": "Replay detected on authenticator"})
+                return
+
+            # --- Step 5: Verify client_id matches TGT ---
+            if ticket_payload.get("client_id") != client_id:
+                self.send_json(403, {"error": "client_id mismatch between TGT and authenticator"})
                 return
 
             kd = self.private_key_data
@@ -231,7 +260,8 @@ class TGSHandler(BaseHTTPRequestHandler):
             service_ticket_payload = {
                 "client_id":    client_id,
                 "service_id":   requested_service_id,
-                "issue_time":   int(time.time()),
+                # Keep issue_time deterministic across TGS authorities for same request.
+                "issue_time":   int(auth_time),
                 "lifetime":     ST_LIFETIME,
                 "key_version":  key_version,
             }
@@ -244,7 +274,7 @@ class TGSHandler(BaseHTTPRequestHandler):
             # Encrypt service-session-key with session_key
             ssk_enc, ssk_iv = aes256_cbc_encrypt(session_key, service_session_key)
 
-            response = {
+            inner_response = {
                 "authority_id":           self.authority_id,
                 "key_version":            key_version,
                 "service_ticket_payload": service_ticket_payload,
@@ -255,6 +285,14 @@ class TGSHandler(BaseHTTPRequestHandler):
                     "s":            int_to_b64(s),
                     "authority_id": self.authority_id
                 }
+            }
+            inner_bytes = json.dumps(inner_response, sort_keys=True).encode("utf-8")
+            tgs_reply_enc, tgs_reply_iv = aes256_cbc_encrypt(session_key, inner_bytes)
+
+            response = {
+                "authority_id": self.authority_id,
+                "tgs_reply_enc": bytes_to_b64(tgs_reply_enc),
+                "tgs_reply_iv": bytes_to_b64(tgs_reply_iv),
             }
 
             print(f"[{self.authority_id}] Issued ST partial signature for "

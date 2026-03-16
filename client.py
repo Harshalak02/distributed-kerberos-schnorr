@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from crypto_utils import (
     schnorr_verify,
-    aes256_cbc_decrypt,
+    aes256_cbc_decrypt, aes256_cbc_encrypt,
     verify_multisig,
     bytes_to_b64, b64_to_bytes,
     int_to_b64, b64_to_int,
@@ -102,6 +102,16 @@ def derive_client_key(client_id: str) -> bytes:
     return hashlib.sha256((client_id + "kerberos-demo-key").encode()).digest()
 
 
+def derive_tgs_cluster_key() -> bytes:
+    import hashlib
+    return hashlib.sha256(b"tgs-cluster-shared-demo-key").digest()
+
+
+def derive_service_key(service_id: str) -> bytes:
+    import hashlib
+    return hashlib.sha256((service_id + "-service-demo-key").encode()).digest()
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Obtain TGT (collect ≥2 AS signatures)
 # ---------------------------------------------------------------------------
@@ -126,7 +136,7 @@ def obtain_tgt(client_id: str, public_registry: dict) -> dict:
     }
 
     collected_sigs = []          # list of {R, s, authority_id}
-    collected_payloads = []      # ticket payloads from each AS
+    canonical_payload_bytes = None
     session_key_enc = None
     session_key_iv = None
     canonical_payload = None     # use the first consistent payload
@@ -143,9 +153,20 @@ def obtain_tgt(client_id: str, public_registry: dict) -> dict:
             print(f"[Client] {auth_id} returned error: {resp['error']}")
             continue
 
+        as_reply_enc = b64_to_bytes(resp.get("as_reply_enc", ""))
+        as_reply_iv = b64_to_bytes(resp.get("as_reply_iv", ""))
+
+        client_key = derive_client_key(client_id)
+        try:
+            inner = aes256_cbc_decrypt(client_key, as_reply_enc, as_reply_iv)
+            inner_resp = json.loads(inner.decode("utf-8"))
+        except Exception as e:
+            print(f"[Client] {auth_id} malformed encrypted response: {e}")
+            continue
+
         # Extract and verify the signature
-        sig = resp.get("signature", {})
-        ticket_payload = resp.get("ticket_payload", {})
+        sig = inner_resp.get("signature", {})
+        ticket_payload = inner_resp.get("ticket_payload", {})
 
         R = b64_to_int(sig["R"])
         s = b64_to_int(sig["s"])
@@ -162,13 +183,19 @@ def obtain_tgt(client_id: str, public_registry: dict) -> dict:
             print(f"[Client] {auth_id} signature INVALID — skipping.")
             continue
 
+        payload_bytes = json.dumps(ticket_payload, sort_keys=True).encode("utf-8")
+        if canonical_payload_bytes is None:
+            canonical_payload_bytes = payload_bytes
+        elif payload_bytes != canonical_payload_bytes:
+            print(f"[Client] {auth_id} payload mismatch with canonical payload — skipping.")
+            continue
+
         print(f"[Client] {auth_id} signature VALID ✓")
         collected_sigs.append(sig)        # store encoded (b64) versions
-        collected_payloads.append(ticket_payload)
 
         if session_key_enc is None:
-            session_key_enc = resp.get("session_key_enc")
-            session_key_iv = resp.get("session_key_iv")
+            session_key_enc = inner_resp.get("session_key_enc")
+            session_key_iv = inner_resp.get("session_key_iv")
             canonical_payload = ticket_payload
 
         if len(collected_sigs) >= THRESHOLD:
@@ -217,13 +244,23 @@ def obtain_service_ticket(client_id: str, requested_service_id: str,
         "nonce":     secure_random_int(1, 2**32)
     }
 
+    tgs_key = derive_tgs_cluster_key()
+    tgt_bytes = json.dumps(tgt, sort_keys=True).encode("utf-8")
+    tgt_enc, tgt_iv = aes256_cbc_encrypt(tgs_key, tgt_bytes)
+
+    auth_bytes = json.dumps(authenticator, sort_keys=True).encode("utf-8")
+    auth_enc, auth_iv = aes256_cbc_encrypt(session_key, auth_bytes)
+
     tgs_request = {
-        "tgt":                  tgt,
-        "authenticator":        authenticator,
+        "tgt_enc":              bytes_to_b64(tgt_enc),
+        "tgt_iv":               bytes_to_b64(tgt_iv),
+        "authenticator_enc":    bytes_to_b64(auth_enc),
+        "authenticator_iv":     bytes_to_b64(auth_iv),
         "requested_service_id": requested_service_id
     }
 
     collected_sigs = []
+    canonical_st_payload_bytes = None
     canonical_st_payload = None
     ssk_enc = None
     ssk_iv = None
@@ -240,8 +277,17 @@ def obtain_service_ticket(client_id: str, requested_service_id: str,
             print(f"[Client] {tgs_id} returned error: {resp['error']}")
             continue
 
-        sig = resp.get("signature", {})
-        st_payload = resp.get("service_ticket_payload", {})
+        tgs_reply_enc = b64_to_bytes(resp.get("tgs_reply_enc", ""))
+        tgs_reply_iv = b64_to_bytes(resp.get("tgs_reply_iv", ""))
+        try:
+            tgs_plain = aes256_cbc_decrypt(session_key, tgs_reply_enc, tgs_reply_iv)
+            inner_resp = json.loads(tgs_plain.decode("utf-8"))
+        except Exception as e:
+            print(f"[Client] {tgs_id} malformed encrypted response: {e}")
+            continue
+
+        sig = inner_resp.get("signature", {})
+        st_payload = inner_resp.get("service_ticket_payload", {})
         a_id = sig["authority_id"]
 
         # Verify TGS signature
@@ -257,13 +303,19 @@ def obtain_service_ticket(client_id: str, requested_service_id: str,
             print(f"[Client] {tgs_id} signature INVALID — skipping.")
             continue
 
+        if canonical_st_payload_bytes is None:
+            canonical_st_payload_bytes = st_msg_bytes
+        elif st_msg_bytes != canonical_st_payload_bytes:
+            print(f"[Client] {tgs_id} payload mismatch with canonical service ticket payload — skipping.")
+            continue
+
         print(f"[Client] {tgs_id} signature VALID ✓")
         collected_sigs.append(sig)
 
         if canonical_st_payload is None:
             canonical_st_payload = st_payload
-            ssk_enc = resp.get("service_session_key_enc")
-            ssk_iv  = resp.get("service_session_key_iv")
+            ssk_enc = inner_resp.get("service_session_key_enc")
+            ssk_iv  = inner_resp.get("service_session_key_iv")
 
         if len(collected_sigs) >= THRESHOLD:
             print(f"\n[Client] Threshold ({THRESHOLD}) reached. Service ticket assembled.")
@@ -281,7 +333,10 @@ def obtain_service_ticket(client_id: str, requested_service_id: str,
         "service_session_key_enc":   ssk_enc,
         "service_session_key_iv":    ssk_iv,
     }
-    return service_ticket, session_key
+    service_session_key = aes256_cbc_decrypt(
+        session_key, b64_to_bytes(ssk_enc), b64_to_bytes(ssk_iv)
+    )
+    return service_ticket, service_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +344,7 @@ def obtain_service_ticket(client_id: str, requested_service_id: str,
 # ---------------------------------------------------------------------------
 
 def access_service(client_id: str, service_id: str,
-                   service_ticket: dict, session_key: bytes) -> dict:
+                   service_ticket: dict, service_session_key: bytes) -> dict:
     print(f"\n{'='*60}")
     print(f"[Client] Phase 3: Accessing service={service_id}")
     print(f"{'='*60}")
@@ -304,10 +359,23 @@ def access_service(client_id: str, service_id: str,
         "timestamp": int(time.time())
     }
 
+    auth_bytes = json.dumps(authenticator, sort_keys=True).encode("utf-8")
+    auth_enc, auth_iv = aes256_cbc_encrypt(service_session_key, auth_bytes)
+
+    service_key = derive_service_key(service_id)
+    service_ticket_for_service = {
+        "payload": service_ticket["payload"],
+        "signatures": service_ticket["signatures"],
+        "service_session_key": bytes_to_b64(service_session_key),
+    }
+    ticket_bytes = json.dumps(service_ticket_for_service, sort_keys=True).encode("utf-8")
+    ticket_enc, ticket_iv = aes256_cbc_encrypt(service_key, ticket_bytes)
+
     request = {
-        "service_ticket":        service_ticket,
-        "authenticator":         authenticator,
-        "session_key_for_decrypt": bytes_to_b64(session_key)
+        "service_ticket_enc":    bytes_to_b64(ticket_enc),
+        "service_ticket_iv":     bytes_to_b64(ticket_iv),
+        "authenticator_enc":     bytes_to_b64(auth_enc),
+        "authenticator_iv":      bytes_to_b64(auth_iv)
     }
 
     resp = http_post(f"{base_url}/access", request)
@@ -327,12 +395,12 @@ def run_client(client_id: str, service_id: str):
     tgt = obtain_tgt(client_id, public_registry)
 
     # Phase 2
-    service_ticket, session_key = obtain_service_ticket(
+    service_ticket, service_session_key = obtain_service_ticket(
         client_id, service_id, tgt, public_registry
     )
 
     # Phase 3
-    result = access_service(client_id, service_id, service_ticket, session_key)
+    result = access_service(client_id, service_id, service_ticket, service_session_key)
 
     print(f"\n{'='*60}")
     print(f"[Client] Service Response:")
