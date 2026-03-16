@@ -224,6 +224,17 @@ class ServiceHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+            for signer in valid_signers:
+                expected_version = self.public_registry.get(signer, {}).get("key_version")
+                if expected_version is not None and key_version != expected_version:
+                    self.send_json(403, {
+                        "error": (
+                            f"Service ticket rejected: key_version mismatch for signer {signer} "
+                            f"(payload={key_version}, registry={expected_version})"
+                        )
+                    })
+                    return
+
             # ---- Access granted ----
             print(f"[ServiceServer:{self.service_id}] ACCESS GRANTED "
                   f"client={client_id}, signers={valid_signers}")
