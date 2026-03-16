@@ -166,6 +166,11 @@ class ASHandler(BaseHTTPRequestHandler):
             if not client_id:
                 self.send_json(400, {"error": "client_id required"})
                 return
+             # Basic freshness check (5-minute skew window)
+            now = int(time.time())
+            if abs(now - int(timestamp)) > 300:
+                self.send_json(400, {"error": "timestamp outside allowed freshness window"})
+                return
 
             # Replay check
             if is_replay(client_id, timestamp):
@@ -183,7 +188,8 @@ class ASHandler(BaseHTTPRequestHandler):
             ticket_payload = {
                 "client_id":    client_id,
                 "service_id":   service_id,
-                "issue_time":   int(time.time()),
+               # "issue_time":   int(time.time()),
+                "issue_time":   int(timestamp),
                 "lifetime":     TGT_LIFETIME,
                 "key_version":  key_version,
                 "client_nonce": client_nonce,

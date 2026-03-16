@@ -126,7 +126,8 @@ def obtain_tgt(client_id: str, public_registry: dict) -> dict:
     }
 
     collected_sigs = []          # list of {R, s, authority_id}
-    collected_payloads = []      # ticket payloads from each AS
+   # collected_payloads = []      # ticket payloads from each AS
+    canonical_payload_bytes = None
     session_key_enc = None
     session_key_iv = None
     canonical_payload = None     # use the first consistent payload
@@ -162,9 +163,16 @@ def obtain_tgt(client_id: str, public_registry: dict) -> dict:
             print(f"[Client] {auth_id} signature INVALID — skipping.")
             continue
 
+        payload_bytes = json.dumps(ticket_payload, sort_keys=True).encode("utf-8")
+        if canonical_payload_bytes is None:
+            canonical_payload_bytes = payload_bytes
+        elif payload_bytes != canonical_payload_bytes:
+            print(f"[Client] {auth_id} payload mismatch with canonical payload — skipping.")
+            continue
+
         print(f"[Client] {auth_id} signature VALID ✓")
         collected_sigs.append(sig)        # store encoded (b64) versions
-        collected_payloads.append(ticket_payload)
+        
 
         if session_key_enc is None:
             session_key_enc = resp.get("session_key_enc")
@@ -224,6 +232,7 @@ def obtain_service_ticket(client_id: str, requested_service_id: str,
     }
 
     collected_sigs = []
+    canonical_st_payload_bytes = None
     canonical_st_payload = None
     ssk_enc = None
     ssk_iv = None
@@ -256,7 +265,13 @@ def obtain_service_ticket(client_id: str, requested_service_id: str,
         if not schnorr_verify(st_msg_bytes, R, s, y, a_id):
             print(f"[Client] {tgs_id} signature INVALID — skipping.")
             continue
-
+        
+        if canonical_st_payload_bytes is None:
+            canonical_st_payload_bytes = st_msg_bytes
+        elif st_msg_bytes != canonical_st_payload_bytes:
+            print(f"[Client] {tgs_id} payload mismatch with canonical service ticket payload — skipping.")
+            continue
+        
         print(f"[Client] {tgs_id} signature VALID ✓")
         collected_sigs.append(sig)
 

@@ -200,7 +200,21 @@ class TGSHandler(BaseHTTPRequestHandler):
                     "valid_signers": valid_signers
                 })
                 return
+# Reject payloads signed under outdated/mismatched key versions.
+            payload_key_version = ticket_payload.get("key_version", 0)
+            for signer in valid_signers:
+                expected_version = self.public_registry.get(signer, {}).get("key_version")
+                if expected_version is not None and payload_key_version != expected_version:
+                    self.send_json(403, {
+                        "error": (
+                            f"TGT rejected: key_version mismatch for signer {signer} "
+                            f"(payload={payload_key_version}, registry={expected_version})"
+                        )
+                    })
+                    return
 
+
+            
             # --- Step 4: Verify ticket is still live ---
             issue_time = ticket_payload.get("issue_time", 0)
             lifetime = ticket_payload.get("lifetime", 0)
@@ -231,7 +245,8 @@ class TGSHandler(BaseHTTPRequestHandler):
             service_ticket_payload = {
                 "client_id":    client_id,
                 "service_id":   requested_service_id,
-                "issue_time":   int(time.time()),
+                #"issue_time":   int(time.time()),
+                "issue_time":   int(auth_time),
                 "lifetime":     ST_LIFETIME,
                 "key_version":  key_version,
             }
