@@ -159,6 +159,11 @@ class ASHandler(BaseHTTPRequestHandler):
             if not client_id:
                 self.send_json(400, {"error": "client_id required"})
                 return
+             # Basic freshness check (5-minute skew window)
+            now = int(time.time())
+            if abs(now - int(timestamp)) > 300:
+                self.send_json(400, {"error": "timestamp outside allowed freshness window"})
+                return
 
             # Basic freshness check (5-minute skew window)
             now = int(time.time())
