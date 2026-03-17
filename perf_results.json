@@ -1,0 +1,170 @@
+{
+  "timestamp": "2026-03-17T16:18:02.713874",
+  "scenarios": [
+    {
+      "name": "All Authorities Online (3-of-3)",
+      "stats": {
+        "scenario": "All Authorities Online (3-of-3)",
+        "total_runs": 3,
+        "successful_runs": 3,
+        "success_rate": "3/3 (100%)",
+        "phase1_ms": {
+          "avg": 44.08,
+          "min": 23.74,
+          "max": 84.24
+        },
+        "phase2_ms": {
+          "avg": 62.43,
+          "min": 48.23,
+          "max": 90.59
+        },
+        "phase3_ms": {
+          "avg": 10.27,
+          "min": 8.49,
+          "max": 12.75
+        },
+        "total_ms": {
+          "avg": 116.77,
+          "min": 80.46,
+          "max": 187.58
+        }
+      },
+      "runs": [
+        {
+          "phase1_ms": 84.24,
+          "phase2_ms": 90.59,
+          "phase3_ms": 12.75,
+          "total_ms": 187.58,
+          "success": true,
+          "error": null
+        },
+        {
+          "phase1_ms": 23.74,
+          "phase2_ms": 48.23,
+          "phase3_ms": 8.49,
+          "total_ms": 80.46,
+          "success": true,
+          "error": null
+        },
+        {
+          "phase1_ms": 24.25,
+          "phase2_ms": 48.46,
+          "phase3_ms": 9.56,
+          "total_ms": 82.27,
+          "success": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "AS1 Offline (2-of-3 fallback)",
+      "stats": {
+        "scenario": "AS1 Offline (2-of-3 fallback)",
+        "total_runs": 3,
+        "successful_runs": 3,
+        "success_rate": "3/3 (100%)",
+        "phase1_ms": {
+          "avg": 31.89,
+          "min": 18.63,
+          "max": 54.16
+        },
+        "phase2_ms": {
+          "avg": 66.74,
+          "min": 52.48,
+          "max": 92.07
+        },
+        "phase3_ms": {
+          "avg": 9.47,
+          "min": 8.35,
+          "max": 11.49
+        },
+        "total_ms": {
+          "avg": 108.1,
+          "min": 79.46,
+          "max": 157.72
+        }
+      },
+      "runs": [
+        {
+          "phase1_ms": 54.16,
+          "phase2_ms": 92.07,
+          "phase3_ms": 11.49,
+          "total_ms": 157.72,
+          "success": true,
+          "error": null
+        },
+        {
+          "phase1_ms": 22.88,
+          "phase2_ms": 55.68,
+          "phase3_ms": 8.56,
+          "total_ms": 87.12,
+          "success": true,
+          "error": null
+        },
+        {
+          "phase1_ms": 18.63,
+          "phase2_ms": 52.48,
+          "phase3_ms": 8.35,
+          "total_ms": 79.46,
+          "success": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "TGS1 Offline (2-of-3 fallback)",
+      "stats": {
+        "scenario": "TGS1 Offline (2-of-3 fallback)",
+        "total_runs": 3,
+        "successful_runs": 3,
+        "success_rate": "3/3 (100%)",
+        "phase1_ms": {
+          "avg": 34.47,
+          "min": 21.71,
+          "max": 55.17
+        },
+        "phase2_ms": {
+          "avg": 53.84,
+          "min": 39.37,
+          "max": 76.66
+        },
+        "phase3_ms": {
+          "avg": 11.04,
+          "min": 9.0,
+          "max": 13.78
+        },
+        "total_ms": {
+          "avg": 99.36,
+          "min": 70.09,
+          "max": 145.61
+        }
+      },
+      "runs": [
+        {
+          "phase1_ms": 55.17,
+          "phase2_ms": 76.66,
+          "phase3_ms": 13.78,
+          "total_ms": 145.61,
+          "success": true,
+          "error": null
+        },
+        {
+          "phase1_ms": 26.54,
+          "phase2_ms": 45.48,
+          "phase3_ms": 10.34,
+          "total_ms": 82.37,
+          "success": true,
+          "error": null
+        },
+        {
+          "phase1_ms": 21.71,
+          "phase2_ms": 39.37,
+          "phase3_ms": 9.0,
+          "total_ms": 70.09,
+          "success": true,
+          "error": null
+        }
+      ]
+    }
+  ]
+}

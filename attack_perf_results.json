@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-03-17T16:31:53.239339",
+  "tgs_endpoint": "http://127.0.0.1:6001",
+  "stats": {
+    "total_attacks": 6,
+    "passed": 6,
+    "pass_rate": "100%",
+    "contained": 5,
+    "accepted": 1,
+    "skipped": 0,
+    "errors": 0,
+    "avg_latency_ms": 28.46,
+    "min_latency_ms": 9.49,
+    "max_latency_ms": 46.99
+  },
+  "attacks": [
+    {
+      "attack": "Attack 1: Single Malicious Authority",
+      "elapsed_ms": 46.99,
+      "expected": "REJECTED",
+      "actual": "CONTAINED",
+      "passed": true,
+      "output_snippet": "\n========================================================================\nATTACK 1: Single malicious"
+    },
+    {
+      "attack": "Attack 2: Modified Ticket Payload",
+      "elapsed_ms": 38.33,
+      "expected": "REJECTED",
+      "actual": "CONTAINED",
+      "passed": true,
+      "output_snippet": "\n========================================================================\nATTACK 2: Modified ticket "
+    },
+    {
+      "attack": "Attack 3: Replay Old Partial Sig",
+      "elapsed_ms": 24.05,
+      "expected": "REJECTED",
+      "actual": "CONTAINED",
+      "passed": true,
+      "output_snippet": "\n========================================================================\nATTACK 3: Replay old parti"
+    },
+    {
+      "attack": "Attack 4: One Key Leakage",
+      "elapsed_ms": 21.29,
+      "expected": "REJECTED",
+      "actual": "CONTAINED",
+      "passed": true,
+      "output_snippet": "\n========================================================================\nATTACK 4: One authority pr"
+    },
+    {
+      "attack": "Attack 5: Authority Offline",
+      "elapsed_ms": 30.58,
+      "expected": "ACCEPTED",
+      "actual": "ACCEPTED",
+      "passed": true,
+      "output_snippet": "\n========================================================================\nATTACK 5: One authority of"
+    },
+    {
+      "attack": "Attack 6: Single Signature Only",
+      "elapsed_ms": 9.49,
+      "expected": "REJECTED",
+      "actual": "CONTAINED",
+      "passed": true,
+      "output_snippet": "\n========================================================================\nATTACK 6: Ticket with only"
+    }
+  ]
+}
