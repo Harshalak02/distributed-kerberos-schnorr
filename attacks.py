@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -136,7 +137,7 @@ def build_tgs_request_from_ticket(ticket: dict, client_id: str, session_key: byt
 
 
 def request_as_partial(client_id: str, authority_id: str, timestamp: int, nonce: int,
-                       service_id: str = "TGS", allow_replay_retry: bool = True) -> dict | None:
+                       service_id: str = "TGS", allow_replay_retry: bool = True) -> Optional[dict]:
     base = AS_NODES[authority_id]
     req = {
         "client_id": client_id,
@@ -166,7 +167,7 @@ def request_as_partial(client_id: str, authority_id: str, timestamp: int, nonce:
     return None
 
 
-def collect_as_partials(client_id: str, required: int = 2, preferred: list[str] | None = None):
+def collect_as_partials(client_id: str, required: int = 2, preferred: Optional[list] = None):
     ts = int(time.time())
     nonce = secure_random_int(1, 2**32)
 

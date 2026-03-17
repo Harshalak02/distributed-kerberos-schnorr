@@ -166,6 +166,7 @@ class TGSHandler(BaseHTTPRequestHandler):
                 tgt_plain = aes256_cbc_decrypt(tgs_cluster_key, tgt_enc, tgt_iv)
                 tgt = json.loads(tgt_plain.decode("utf-8"))
             except Exception:
+                print(f"[{self.authority_id}] ❌  REJECTED client=unknown — Could not decrypt TGT (malformed or wrong key)")
                 self.send_json(403, {"error": "Could not decrypt TGT"})
                 return
 
@@ -195,6 +196,11 @@ class TGSHandler(BaseHTTPRequestHandler):
             valid, valid_signers = verify_multisig(msg_bytes, decoded_sigs, as_registry,
                                                    threshold=TGT_THRESHOLD)
             if not valid:
+                client_id_attempt = ticket_payload.get("client_id", "unknown")
+                signer_ids = [s["authority_id"] for s in tgt_signatures]
+                print(f"[{self.authority_id}] ❌  REJECTED client='{client_id_attempt}' "
+                      f"— Insufficient AS signatures (got {len(valid_signers)}/{TGT_THRESHOLD}: "
+                      f"submitted={signer_ids}, valid={valid_signers})")
                 self.send_json(403, {
                     "error": "TGT rejected: insufficient valid AS signatures",
                     "valid_signers": valid_signers
@@ -206,18 +212,19 @@ class TGSHandler(BaseHTTPRequestHandler):
             for signer in valid_signers:
                 expected_version = self.public_registry.get(signer, {}).get("key_version")
                 if expected_version is not None and payload_key_version != expected_version:
-                    self.send_json(403, {
-                        "error": (
-                            f"TGT rejected: key_version mismatch for signer {signer} "
-                            f"(payload={payload_key_version}, registry={expected_version})"
-                        )
-                    })
+                    client_id_attempt = ticket_payload.get("client_id", "unknown")
+                    reason = (f"key_version mismatch for signer {signer} "
+                              f"(payload={payload_key_version}, registry={expected_version})")
+                    print(f"[{self.authority_id}] ❌  REJECTED client='{client_id_attempt}' — {reason}")
+                    self.send_json(403, {"error": f"TGT rejected: {reason}"})
                     return
 
             # --- Step 4: Verify ticket is still live ---
             issue_time = ticket_payload.get("issue_time", 0)
             lifetime = ticket_payload.get("lifetime", 0)
             if int(time.time()) > issue_time + lifetime:
+                client_id_attempt = ticket_payload.get("client_id", "unknown")
+                print(f"[{self.authority_id}] ❌  REJECTED client='{client_id_attempt}' — TGT expired")
                 self.send_json(403, {"error": "TGT expired"})
                 return
 
@@ -227,6 +234,7 @@ class TGSHandler(BaseHTTPRequestHandler):
             try:
                 session_key = aes256_cbc_decrypt(client_key, session_key_enc, session_key_iv)
             except Exception:
+                print(f"[{self.authority_id}] ❌  REJECTED — Could not decrypt session key (unknown client)")
                 self.send_json(403, {"error": "Could not decrypt session key — invalid client"})
                 return
 
@@ -234,6 +242,7 @@ class TGSHandler(BaseHTTPRequestHandler):
                 auth_plain = aes256_cbc_decrypt(session_key, auth_enc, auth_iv)
                 authenticator = json.loads(auth_plain.decode("utf-8"))
             except Exception:
+                print(f"[{self.authority_id}] ❌  REJECTED — Could not decrypt authenticator (wrong session key)")
                 self.send_json(403, {"error": "Could not decrypt authenticator"})
                 return
 
@@ -242,11 +251,15 @@ class TGSHandler(BaseHTTPRequestHandler):
 
             # --- Step 1: Replay protection ---
             if is_replay(client_id, auth_time):
+                print(f"[{self.authority_id}] ❌  REJECTED client='{client_id}' — Replay attack detected on authenticator")
                 self.send_json(400, {"error": "Replay detected on authenticator"})
                 return
 
             # --- Step 5: Verify client_id matches TGT ---
             if ticket_payload.get("client_id") != client_id:
+                print(f"[{self.authority_id}] ❌  REJECTED client='{client_id}' "
+                      f"— client_id mismatch (TGT says '{ticket_payload.get('client_id')}', "
+                      f"authenticator says '{client_id}')")
                 self.send_json(403, {"error": "client_id mismatch between TGT and authenticator"})
                 return
 
