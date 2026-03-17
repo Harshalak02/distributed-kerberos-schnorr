@@ -14,9 +14,6 @@ Scenarios implemented:
 
 Run:
   python attacks.py
-
-Prerequisite:
-  Start AS/TGS servers first (see README).
 """
 
 import json
@@ -33,7 +30,7 @@ from crypto_utils import (
     aes256_cbc_encrypt, aes256_cbc_decrypt,
     secure_random_int,
     bytes_to_b64, b64_to_bytes,
-    int_to_b64, b64_to_int,
+    int_to_b64,
     SCHNORR_G, SCHNORR_Q, SCHNORR_P,
     mod_exp,
 )
@@ -53,7 +50,7 @@ TGS_NODES = {
 
 PASS = "✅  CONTAINED"
 FAIL = "❌  SYSTEM BROKEN"
-SKIP = "⚠️  SKIPPED (server unavailable)"
+SKIP = "⚠️  SKIPPED"
 DIVIDER = "=" * 72
 
 
@@ -78,6 +75,10 @@ def http_post(url: str, payload: dict, timeout: int = 8) -> dict:
             return json.loads(body)
         except Exception:
             return {"error": f"HTTP {e.code}: {body}"}
+    except urllib.error.URLError as e:
+        return {"error": f"URLError: {e.reason}"}
+    except OSError as e:
+        return {"error": f"OSError: {e}"}
 
 
 def derive_client_key(client_id: str) -> bytes:
@@ -105,13 +106,9 @@ def load_private_key(authority_id: str) -> dict:
 
 def find_tgs_base() -> str:
     for _, base in TGS_NODES.items():
-        try:
-            r = http_post(f"{base}/grant_service_ticket", {})
-            # Any JSON reply means server reachable.
-            if isinstance(r, dict):
-                return base
-        except Exception:
-            pass
+        r = http_post(f"{base}/grant_service_ticket", {})
+        if isinstance(r, dict) and "URLError" not in str(r.get("error", "")):
+            return base
     return ""
 
 
@@ -139,7 +136,7 @@ def build_tgs_request_from_ticket(ticket: dict, client_id: str, session_key: byt
 
 
 def request_as_partial(client_id: str, authority_id: str, timestamp: int, nonce: int,
-                       service_id: str = "TGS") -> dict:
+                       service_id: str = "TGS", allow_replay_retry: bool = True) -> dict | None:
     base = AS_NODES[authority_id]
     req = {
         "client_id": client_id,
@@ -147,17 +144,63 @@ def request_as_partial(client_id: str, authority_id: str, timestamp: int, nonce:
         "timestamp": timestamp,
         "nonce": nonce,
     }
-    resp = http_post(f"{base}/authenticate", req)
-    if "error" in resp:
-        raise RuntimeError(f"{authority_id} error: {resp['error']}")
-    return decode_as_reply(client_id, resp)
+
+    attempts = 2 if allow_replay_retry else 1
+    for attempt in range(attempts):
+        req["timestamp"] = timestamp + attempt
+        resp = http_post(f"{base}/authenticate", req)
+
+        if "error" in resp:
+            err = str(resp["error"])
+            if "Replay detected" in err and attempt + 1 < attempts:
+                continue
+            print(f"  [{authority_id}] failed: {err}")
+            return None
+
+        try:
+            return decode_as_reply(client_id, resp)
+        except Exception as e:
+            print(f"  [{authority_id}] decrypt/parse failed: {e}")
+            return None
+
+    return None
 
 
-def build_ticket_from_as_partials(client_id: str, partials: list) -> tuple:
-    if not partials:
+def collect_as_partials(client_id: str, required: int = 2, preferred: list[str] | None = None):
+    ts = int(time.time())
+    nonce = secure_random_int(1, 2**32)
+
+    order = preferred[:] if preferred else list(AS_NODES.keys())
+    for aid in AS_NODES:
+        if aid not in order:
+            order.append(aid)
+
+    partials = []
+    for aid in order:
+        p = request_as_partial(client_id, aid, ts, nonce)
+        if p is not None:
+            partials.append((aid, p))
+        if len(partials) >= required:
+            break
+    return partials
+
+
+def build_ticket_from_as_partials(client_id: str, partial_pairs: list) -> tuple:
+    if not partial_pairs:
         raise ValueError("No AS partials")
 
-    canonical_payload = partials[0]["ticket_payload"]
+    buckets = {}
+    for _, p in partial_pairs:
+        payload = p["ticket_payload"]
+        pbytes = json.dumps(payload, sort_keys=True).encode("utf-8")
+        key = bytes_to_b64(pbytes)
+        b = buckets.setdefault(key, {"payload": payload, "partials": []})
+        b["partials"].append(p)
+
+    best = max(buckets.values(), key=lambda x: len(x["partials"]))
+    partials = best["partials"]
+
+    canonical_payload = best["payload"]
     signatures = [p["signature"] for p in partials]
 
     sk_enc = partials[0]["session_key_enc"]
@@ -186,7 +229,7 @@ def print_tgs_result(result: dict, expect_reject: bool):
 
 
 # ---------------------------------------------------------------------------
-# Attacks (networked)
+# Attacks
 # ---------------------------------------------------------------------------
 
 def attack_1_single_malicious_authority(tgs_base: str):
@@ -224,15 +267,15 @@ def attack_1_single_malicious_authority(tgs_base: str):
 
 def attack_2_modified_ticket_payload(tgs_base: str):
     print(f"\n{DIVIDER}\nATTACK 2: Modified ticket payload\n{DIVIDER}")
-    print("Scenario: get valid AS1+AS2 signatures, then tamper payload before sending to TGS.")
+    print("Scenario: get valid signatures from any 2 AS nodes, then tamper payload.")
 
     client_id = "alice"
-    ts = int(time.time())
-    n = secure_random_int(1, 2**32)
+    partials = collect_as_partials(client_id, required=2, preferred=["AS1", "AS2", "AS3"])
+    if len(partials) < 2:
+        print(f"  {SKIP}: not enough AS nodes reachable for this scenario.")
+        return
 
-    p1 = request_as_partial(client_id, "AS1", ts, n)
-    p2 = request_as_partial(client_id, "AS2", ts, n)
-    ticket, session_key = build_ticket_from_as_partials(client_id, [p1, p2])
+    ticket, session_key = build_ticket_from_as_partials(client_id, partials)
 
     tampered = dict(ticket)
     tampered_payload = dict(ticket["ticket_payload"])
@@ -246,17 +289,24 @@ def attack_2_modified_ticket_payload(tgs_base: str):
 
 def attack_3_replay_old_partial_signature(tgs_base: str):
     print(f"\n{DIVIDER}\nATTACK 3: Replay old partial signature\n{DIVIDER}")
-    print("Scenario: replay AS1 signature from old auth round with AS2 signature from new round.")
+    print("Scenario: replay AS1 signature from old round + AS2/AS3 from new round.")
 
-    client_id = "alice"
+    client_id = "alice_replay"
 
     ts_old = int(time.time()) - 20
     old = request_as_partial(client_id, "AS1", ts_old, 12345)
+    if old is None:
+        print(f"  {SKIP}: could not obtain old AS1 signature.")
+        return
 
     ts_new = int(time.time())
     new = request_as_partial(client_id, "AS2", ts_new, 67890)
+    if new is None:
+        new = request_as_partial(client_id, "AS3", ts_new + 1, 67891)
+    if new is None:
+        print(f"  {SKIP}: could not obtain new second authority signature.")
+        return
 
-    # Mix old AS1 signature into new payload ticket
     mixed_ticket = {
         "ticket_payload": new["ticket_payload"],
         "signatures": [old["signature"], new["signature"]],
@@ -316,7 +366,8 @@ def attack_5_authority_offline(tgs_base: str):
     print(f"\n{DIVIDER}\nATTACK 5: One authority offline\n{DIVIDER}")
     print("Scenario: AS1 is offline, but AS2+AS3 are enough for 2-of-3.")
 
-    client_id = "bob"
+    # Unique client id each run avoids replay-cache collisions.
+    client_id = f"bob_offline_{int(time.time())}"
     ts = int(time.time())
     nonce = secure_random_int(1, 2**32)
 
@@ -330,10 +381,17 @@ def attack_5_authority_offline(tgs_base: str):
     })
     print("  AS1 simulated offline response:", off_resp.get("error", "unreachable"))
 
-    p2 = request_as_partial(client_id, "AS2", ts, nonce)
-    p3 = request_as_partial(client_id, "AS3", ts, nonce)
-    ticket, session_key = build_ticket_from_as_partials(client_id, [p2, p3])
+    # Important: same ts+nonce for AS2 and AS3, and no replay-retry timestamp bump.
+    p2 = request_as_partial(client_id, "AS2", ts, nonce, allow_replay_retry=False)
+    p3 = request_as_partial(client_id, "AS3", ts, nonce, allow_replay_retry=False)
 
+    if p2 is None or p3 is None:
+        print(f"  {SKIP}: need both AS2 and AS3 alive for this scenario.")
+        return
+
+    ticket, session_key = build_ticket_from_as_partials(
+        client_id, [("AS2", p2), ("AS3", p3)]
+    )
     req = build_tgs_request_from_ticket(ticket, client_id, session_key)
     result = http_post(f"{tgs_base}/grant_service_ticket", req)
     print_tgs_result(result, expect_reject=False)
@@ -348,6 +406,10 @@ def attack_6_single_valid_signature(tgs_base: str):
     nonce = secure_random_int(1, 2**32)
 
     p1 = request_as_partial(client_id, "AS1", ts, nonce)
+    if p1 is None:
+        print(f"  {SKIP}: AS1 unavailable for this scenario.")
+        return
+
     session_key = aes256_cbc_decrypt(
         derive_client_key(client_id),
         b64_to_bytes(p1["session_key_enc"]),
@@ -367,12 +429,36 @@ def attack_6_single_valid_signature(tgs_base: str):
 
 
 # ---------------------------------------------------------------------------
-# Runner
+# Menu / Runner
 # ---------------------------------------------------------------------------
 
-def run_all_attacks():
+def run_all_attacks(tgs_base: str):
+    attack_1_single_malicious_authority(tgs_base)
+    attack_2_modified_ticket_payload(tgs_base)
+    attack_3_replay_old_partial_signature(tgs_base)
+    attack_4_one_key_leakage(tgs_base)
+    attack_5_authority_offline(tgs_base)
+    attack_6_single_valid_signature(tgs_base)
+
+
+def print_menu():
+    print(f"\n{DIVIDER}")
+    print("Choose attack:")
+    print("  1) Single malicious authority forged ticket")
+    print("  2) Modified ticket payload")
+    print("  3) Replay old partial signature")
+    print("  4) One private key leakage")
+    print("  5) Authority offline scenario")
+    print("  6) One valid signature only")
+    print("  7) Run ALL attacks")
+    print("  8) Refresh TGS endpoint")
+    print("  0) Exit")
+    print(DIVIDER)
+
+
+def main():
     print("\n" + DIVIDER)
-    print("  KERBEROS MULTI-SIG ATTACK SUITE (NETWORKED)")
+    print("  KERBEROS MULTI-SIG ATTACK SUITE (NETWORKED, MENU-DRIVEN)")
     print(DIVIDER)
 
     if not os.path.exists(os.path.join(KEYS_DIR, "public_key_registry.json")):
@@ -381,21 +467,50 @@ def run_all_attacks():
 
     tgs_base = find_tgs_base()
     if not tgs_base:
-        print(f"\n{SKIP}")
-        print("Start at least one TGS server (e.g., TGS1 on port 6001) and rerun.")
-        sys.exit(1)
+        print(f"\n{SKIP}: no TGS endpoint reachable right now.")
+        print("Start at least one TGS server (e.g., TGS1 on port 6001).")
+    else:
+        print(f"[*] Using TGS endpoint: {tgs_base}")
 
-    print(f"[*] Using TGS endpoint: {tgs_base}")
+    while True:
+        print_menu()
+        choice = input("Enter choice: ").strip()
 
-    attack_1_single_malicious_authority(tgs_base)
-    attack_2_modified_ticket_payload(tgs_base)
-    attack_3_replay_old_partial_signature(tgs_base)
-    attack_4_one_key_leakage(tgs_base)
-    attack_5_authority_offline(tgs_base)
-    attack_6_single_valid_signature(tgs_base)
+        if choice == "0":
+            print("Exiting.")
+            break
+        if choice == "8":
+            tgs_base = find_tgs_base()
+            if not tgs_base:
+                print(f"{SKIP}: still no TGS endpoint reachable.")
+            else:
+                print(f"[*] Refreshed TGS endpoint: {tgs_base}")
+            continue
 
-    print(f"\n{DIVIDER}\n  Completed all mandatory attack scenarios.\n{DIVIDER}")
+        if not tgs_base:
+            print(f"{SKIP}: no TGS reachable. Start TGS and choose 8 to refresh.")
+            continue
+
+        try:
+            if choice == "1":
+                attack_1_single_malicious_authority(tgs_base)
+            elif choice == "2":
+                attack_2_modified_ticket_payload(tgs_base)
+            elif choice == "3":
+                attack_3_replay_old_partial_signature(tgs_base)
+            elif choice == "4":
+                attack_4_one_key_leakage(tgs_base)
+            elif choice == "5":
+                attack_5_authority_offline(tgs_base)
+            elif choice == "6":
+                attack_6_single_valid_signature(tgs_base)
+            elif choice == "7":
+                run_all_attacks(tgs_base)
+            else:
+                print("Invalid choice.")
+        except Exception as e:
+            print(f"{SKIP}: scenario aborted due to runtime error: {e}")
 
 
 if __name__ == "__main__":
-    run_all_attacks()
+    main()
